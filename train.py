@@ -240,6 +240,26 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     model.class_weights = labels_to_class_weights(dataset.labels, nc).to(device) * nc  # attach class weights
     model.names = names
 
+    # data type
+    if opt.precision == "fp32":
+        dtype=torch.float32
+    elif opt.precision == "bf16":
+        dtype=torch.bfloat16
+    elif opt.precision == "fp16":
+        dtype=torch.half
+    else:
+        raise ValueError("--precision needs to be the following:: fp32, bf16, fp16")
+    # ipex
+    if opt.ipex:
+        import intel_extension_for_pytorch as ipex
+        if opt.precision == "fp32":
+            model, optimizer = ipex.optimize(model, optimizer=optimizer)
+        elif opt.precision == "bf16" or opt.precision == "fp16":
+            model, optimizer = ipex.optimize(model, optimizer=optimizer, dtype=dtype)
+        else:
+            raise ValueError("--precision needs to be the following:: fp32, bf16, fp16")
+        print("Running IPEX ...")
+
     # Start training
     t0 = time.time()
     nb = len(train_loader)  # number of batches
@@ -257,6 +277,8 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 f'Using {train_loader.num_workers * WORLD_SIZE} dataloader workers\n'
                 f"Logging results to {colorstr('bold', save_dir)}\n"
                 f'Starting training for {epochs} epochs...')
+    training_time = 0
+    num_iters = 0
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
         callbacks.run('on_train_epoch_start')
         model.train()
@@ -303,8 +325,21 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                     ns = [math.ceil(x * sf / gs) * gs for x in imgs.shape[2:]]  # new shape (stretched to gs-multiple)
                     imgs = nn.functional.interpolate(imgs, size=ns, mode='bilinear', align_corners=False)
 
-            # Forward
-            with torch.cuda.amp.autocast(amp):
+            start = time.time()
+            if opt.precision == "bf16" or opt.precision == "fp16":
+                with torch.cpu.amp.autocast(dtype=dtype):
+                    # Forward
+                    pred = model(imgs)  # forward
+                    loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
+                    if RANK != -1:
+                        loss *= WORLD_SIZE  # gradient averaged between devices in DDP mode
+                    if opt.quad:
+                        loss *= 4.
+
+                    # Backward
+                    scaler.scale(loss).backward()
+            else:
+                # Forward
                 pred = model(imgs)  # forward
                 loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
                 if RANK != -1:
@@ -312,8 +347,10 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 if opt.quad:
                     loss *= 4.
 
-            # Backward
-            scaler.scale(loss).backward()
+                # Backward
+                scaler.scale(loss).backward()
+                training_time += time.time() - start
+                num_iters = num_iters + 1
 
             # Optimize - https://pytorch.org/docs/master/notes/amp_examples.html
             if ni - last_opt_step >= accumulate:
@@ -336,6 +373,8 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 if callbacks.stop_training:
                     return
             # end batch ------------------------------------------------------------------------------------------------
+            if opt.benchmark and i >=20:
+                break
 
         # Scheduler
         lr = [x['lr'] for x in optimizer.param_groups]  # for loggers
@@ -400,31 +439,101 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
 
         # end epoch ----------------------------------------------------------------------------------------------------
     # end training -----------------------------------------------------------------------------------------------------
-    if RANK in {-1, 0}:
-        LOGGER.info(f'\n{epoch - start_epoch + 1} epochs completed in {(time.time() - t0) / 3600:.3f} hours.')
-        for f in last, best:
-            if f.exists():
-                strip_optimizer(f)  # strip optimizers
-                if f is best:
-                    LOGGER.info(f'\nValidating {f}...')
-                    results, _, _ = validate.run(
-                        data_dict,
-                        batch_size=batch_size // WORLD_SIZE * 2,
-                        imgsz=imgsz,
-                        model=attempt_load(f, device).half(),
-                        iou_thres=0.65 if is_coco else 0.60,  # best pycocotools at iou 0.65
-                        single_cls=single_cls,
-                        dataloader=val_loader,
-                        save_dir=save_dir,
-                        save_json=is_coco,
-                        verbose=True,
-                        plots=plots,
-                        callbacks=callbacks,
-                        compute_loss=compute_loss)  # val best model with plots
-                    if is_coco:
-                        callbacks.run('on_fit_epoch_end', list(mloss) + list(results) + lr, epoch, best_fitness, fi)
+            
+    print("training throughput: {:.3f} fps".format(num_iters*batch_size/training_time))
+    print("training time: {:.3f} s".format(training_time))
+    
+    if opt.profile:
+        for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
+            callbacks.run('on_train_batch_start')
+            ni = i + nb * epoch  # number integrated batches (since train start)
+            imgs = imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
 
-        callbacks.run('on_train_end', last, best, epoch, results)
+            # Warmup
+            if ni <= nw:
+                xi = [0, nw]  # x interp
+                # compute_loss.gr = np.interp(ni, xi, [0.0, 1.0])  # iou loss ratio (obj_loss = 1.0 or iou)
+                accumulate = max(1, np.interp(ni, xi, [1, nbs / batch_size]).round())
+                for j, x in enumerate(optimizer.param_groups):
+                    # bias lr falls from 0.1 to lr0, all other lrs rise from 0.0 to lr0
+                    x['lr'] = np.interp(ni, xi, [hyp['warmup_bias_lr'] if j == 0 else 0.0, x['initial_lr'] * lf(epoch)])
+                    if 'momentum' in x:
+                        x['momentum'] = np.interp(ni, xi, [hyp['warmup_momentum'], hyp['momentum']])
+
+            # Multi-scale
+            if opt.multi_scale:
+                sz = random.randrange(imgsz * 0.5, imgsz * 1.5 + gs) // gs * gs  # size
+                sf = sz / max(imgs.shape[2:])  # scale factor
+                if sf != 1:
+                    ns = [math.ceil(x * sf / gs) * gs for x in imgs.shape[2:]]  # new shape (stretched to gs-multiple)
+                    imgs = nn.functional.interpolate(imgs, size=ns, mode='bilinear', align_corners=False)
+
+            with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU], record_shapes=True) as p:
+                if opt.precision == "bf16" or opt.precision == "fp16":
+                    with torch.cpu.amp.autocast(dtype=dtype):
+                        # Forward
+                        pred = model(imgs)  # forward
+                        loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
+                        if RANK != -1:
+                            loss *= WORLD_SIZE  # gradient averaged between devices in DDP mode
+                        if opt.quad:
+                            loss *= 4.
+
+                        # Backward
+                        scaler.scale(loss).backward()
+                else:
+                    # Forward
+                    pred = model(imgs)  # forward
+                    loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
+                    if RANK != -1:
+                        loss *= WORLD_SIZE  # gradient averaged between devices in DDP mode
+                    if opt.quad:
+                        loss *= 4.
+
+                    # Backward
+                    scaler.scale(loss).backward()
+            
+            output = p.key_averages().table(sort_by="self_cpu_time_total")
+            print(output)
+            import pathlib
+            timeline_dir = str(pathlib.Path.cwd()) + '/timeline/'
+            if not os.path.exists(timeline_dir):
+                try:
+                    os.makedirs(timeline_dir)
+                except:
+                    pass
+            timeline_file = timeline_dir + 'timeline-' + str(torch.backends.quantized.engine) + '-' + \
+                        'yolov5-train_' + '-' + str(os.getpid()) + '.json'
+            p.export_chrome_trace(timeline_file)
+            
+            break
+
+    if not opt.benchmark:
+        if RANK in {-1, 0}:
+            LOGGER.info(f'\n{epoch - start_epoch + 1} epochs completed in {(time.time() - t0) / 3600:.3f} hours.')
+            for f in last, best:
+                if f.exists():
+                    strip_optimizer(f)  # strip optimizers
+                    if f is best:
+                        LOGGER.info(f'\nValidating {f}...')
+                        results, _, _ = validate.run(
+                            data_dict,
+                            batch_size=batch_size // WORLD_SIZE * 2,
+                            imgsz=imgsz,
+                            model=attempt_load(f, device).half(),
+                            iou_thres=0.65 if is_coco else 0.60,  # best pycocotools at iou 0.65
+                            single_cls=single_cls,
+                            dataloader=val_loader,
+                            save_dir=save_dir,
+                            save_json=is_coco,
+                            verbose=True,
+                            plots=plots,
+                            callbacks=callbacks,
+                            compute_loss=compute_loss)  # val best model with plots
+                        if is_coco:
+                            callbacks.run('on_fit_epoch_end', list(mloss) + list(results) + lr, epoch, best_fitness, fi)
+    
+            callbacks.run('on_train_end', last, best, epoch, results)
 
     torch.cuda.empty_cache()
     return results
@@ -472,6 +581,11 @@ def parse_opt(known=False):
     parser.add_argument('--upload_dataset', nargs='?', const=True, default=False, help='Upload data, "val" option')
     parser.add_argument('--bbox_interval', type=int, default=-1, help='Set bounding-box image logging interval')
     parser.add_argument('--artifact_alias', type=str, default='latest', help='Version of dataset artifact to use')
+    
+    parser.add_argument('--precision', type=str, default="fp32", help='precision: fp32, bf16, fp16')
+    parser.add_argument('--ipex', action='store_true', default=False, help='ipex')
+    parser.add_argument('--profile', action='store_true', default=False, help='profile')
+    parser.add_argument('--benchmark', action='store_true', default=False, help='benchmark')
 
     return parser.parse_known_args()[0] if known else parser.parse_args()
 
